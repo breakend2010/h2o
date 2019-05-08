@@ -24,6 +24,7 @@
 #include "h2o/http2_scheduler.h"
 #include "h2o/http3_common.h"
 #include "h2o/http3_server.h"
+#include "h2o/http3_internal.h"
 
 #define H2O_HTTP3_MAX_PLACEHOLDERS 10
 
@@ -89,6 +90,13 @@ struct st_h2o_http3_server_conn_t {
         h2o_http2_scheduler_node_t root;
         h2o_http2_scheduler_openref_t placeholders[H2O_HTTP3_MAX_PLACEHOLDERS];
         kh_h2o_http3_queued_priority_t *queued_reqs;
+        /**
+         * States for unidirectional streams. Each element is a bit vector where slot for each stream is defined as: 1 << stream_id.
+         */
+        struct {
+            uint16_t new_data;
+            uint16_t non_new_data;
+        } unistreams;
     } scheduler;
 };
 
@@ -748,6 +756,111 @@ SchedulerReady:
 
 quicly_stream_open_t h2o_http3_server_on_stream_open = {stream_open_cb};
 
+static int scheduler_can_send(quicly_stream_scheduler_t *sched, quicly_conn_t *qc, int new_data_allowed)
+{
+    struct st_h2o_http3_server_conn_t *conn = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http3_server_conn_t, h3, *quicly_get_data(qc));
+
+    if (new_data_allowed) {
+        if (conn->scheduler.unistreams.new_data != 0)
+            return 1;
+        if (h2o_http2_scheduler_is_active(&conn->scheduler.root))
+            return 1;
+    } else {
+        if (conn->scheduler.unistreams.non_new_data != 0)
+            return 1;
+        assert(!"FIXME ask scheduler");
+    }
+
+    return 0;
+}
+
+static int scheduler_do_send_stream(h2o_http2_scheduler_openref_t *ref, int *still_is_active, void *cb_arg)
+{
+    struct st_h2o_http3_server_stream_t *stream = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http3_server_stream_t, scheduler, ref);
+    quicly_send_context_t *s = cb_arg;
+
+    return quicly_send_stream(stream->quic, s);
+}
+
+static int scheduler_do_send(quicly_stream_scheduler_t *sched, quicly_conn_t *qc, quicly_send_context_t *s)
+{
+#define SEND_UNISTREAM(bitmask, label) \
+    do { \
+        struct st_h2o_http3_egress_unistream_t *stream = conn->h3._control_streams.egress.label; \
+        if ((conn->scheduler.unistreams.bitmask & (1 << stream->quic->stream_id)) != 0) { \
+            conn->scheduler.unistreams.bitmask &= ~ (1 << stream->quic->stream_id); \
+            if ((ret = quicly_send_stream(stream->quic, s)) != 0) \
+                goto Exit; \
+        } \
+    } while (0)
+
+    struct st_h2o_http3_server_conn_t *conn = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http3_server_conn_t, h3, *quicly_get_data(qc));
+    int ret = 0;
+
+    while (quicly_can_send_stream_data(conn->h3.quic, s, 1)) {
+        if (conn->scheduler.unistreams.new_data != 0) {
+            SEND_UNISTREAM(new_data, control);
+            SEND_UNISTREAM(new_data, qpack_encoder);
+            SEND_UNISTREAM(new_data, qpack_decoder);
+        }
+        if (h2o_http2_scheduler_is_active(&conn->scheduler.root)) {
+            if ((ret = h2o_http2_scheduler_run(&conn->scheduler.root, scheduler_do_send_stream, s)) != 0)
+                goto Exit;
+        }
+    }
+
+    while (quicly_can_send_stream_data(conn->h3.quic, s, 0)) {
+        if (conn->scheduler.unistreams.non_new_data != 0) {
+            SEND_UNISTREAM(new_data, control);
+            SEND_UNISTREAM(new_data, qpack_encoder);
+            SEND_UNISTREAM(new_data, qpack_decoder);
+        }
+        assert(!h2o_http2_scheduler_is_active(&conn->scheduler.root)); /* FIXME */
+    }
+
+Exit:
+    return ret;
+
+#undef SEND_UNISTREAM
+}
+
+static void scheduler_clear(struct st_quicly_stream_scheduler_t *sched, quicly_stream_t *qs)
+{
+    if (quicly_stream_is_unidirectional(qs->stream_id)) {
+        struct st_h2o_http3_server_conn_t *conn =
+            H2O_STRUCT_FROM_MEMBER(struct st_h2o_http3_server_conn_t, h3, *quicly_get_data(qs->conn));
+        assert(qs->stream_id < sizeof(uint32_t) * 8);
+        uint32_t mask = 1 << qs->stream_id;
+        conn->scheduler.unistreams.new_data &= ~mask;
+        conn->scheduler.unistreams.non_new_data &= ~mask;
+    } else {
+        struct st_h2o_http3_server_stream_t *stream = qs->data;
+        h2o_http2_scheduler_deactivate(&stream->scheduler);
+    }
+}
+
+static void scheduler_set_new_data(struct st_quicly_stream_scheduler_t *sched, quicly_stream_t *qs)
+{
+    if (quicly_stream_is_unidirectional(qs->stream_id)) {
+        struct st_h2o_http3_server_conn_t *conn =
+            H2O_STRUCT_FROM_MEMBER(struct st_h2o_http3_server_conn_t, h3, *quicly_get_data(qs->conn));
+        assert(qs->stream_id < sizeof(uint32_t) * 8);
+        uint32_t mask = 1 << qs->stream_id;
+        conn->scheduler.unistreams.new_data |= mask;
+        conn->scheduler.unistreams.non_new_data &= ~mask;
+    } else {
+        struct st_h2o_http3_server_stream_t *stream = qs->data;
+        h2o_http2_scheduler_activate(&stream->scheduler);
+    }
+}
+
+static void scheduler_set_non_new_data(struct st_quicly_stream_scheduler_t *sched, quicly_stream_t *stream)
+{
+}
+
+quicly_stream_scheduler_t h2o_http3_server_stream_scheduler = {scheduler_can_send, scheduler_do_send, scheduler_clear,
+                                                               scheduler_set_new_data, scheduler_set_non_new_data};
+
 static void on_h3_destroy(h2o_http3_conn_t *h3)
 {
     struct st_h2o_http3_server_conn_t *conn = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http3_server_conn_t, h3, h3);
@@ -821,6 +934,7 @@ SynFound : {
     h2o_http2_scheduler_init(&conn->scheduler.root);
     memset(&conn->scheduler.placeholders, 0, sizeof(conn->scheduler.placeholders));
     conn->scheduler.queued_reqs = NULL;
+    memset(&conn->scheduler.unistreams, 0, sizeof(conn->scheduler.unistreams));
     quicly_conn_t *qconn;
 
     /* accept connection */
